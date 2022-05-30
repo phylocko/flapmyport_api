@@ -5,18 +5,69 @@ import (
 	"encoding/json"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const timeFormat = "2006-01-02 15:04:05"
-const noIndex = -1
+const (
+	timeFormat      = "2006-01-02 15:04:05"
+	flapChartWidth  = 333
+	flapChartHeight = 10
+
+	ifStatusUP          = 1
+	ifStatusDOWN        = 2
+	ifStatusUpString    = "1"
+	ifStatusDownString  = "2"
+	ifStatusUpCaption   = "up"
+	ifStatusDownCaption = "down"
+
+	actionReview      = "review"
+	actionFlapChart   = "flapchart"
+	actionFlapHistory = "flaphistory"
+	actionCheck       = "check"
+
+	defaultReviewInterval = time.Hour
+
+	getParamIfIndex   = "ifindex"
+	getParamHost      = "host"
+	getParamStartTime = "start"
+	getParamEndTime   = "end"
+	getParamInterval  = "interval"
+	getParamFilter    = "filter"
+)
 
 // DATA FORMATS
 
-type PortDBEntry struct {
+type FMPTime time.Time
+
+func (f FMPTime) MarshalJSON() ([]byte, error) {
+	time := time.Time(f).Format(timeFormat)
+	timeStr := fmt.Sprintf(time)
+	return []byte(timeStr), nil
+}
+
+type CheckResult struct {
+	CheckResult string `json:"checkResult"`
+}
+
+type QueryParams struct {
+	action  string
+	IfIndex int
+	Host    string
+	Start   time.Time
+	End     time.Time
+	Filter  Filter
+}
+
+// PortRow is a DB row representation
+type PortRow struct {
 	Id            int
 	Sid           string
 	Time          time.Time
@@ -30,6 +81,7 @@ type PortDBEntry struct {
 	IfOperStatus  string
 }
 
+// ReviewResult is a structure
 type ReviewResult struct {
 	Params Params `json:"params"`
 	Hosts  []Host `json:"hosts"`
@@ -38,9 +90,32 @@ type ReviewResult struct {
 type Params struct {
 	TimeStart     *time.Time `json:"timeStart"`
 	TimeEnd       *time.Time `json:"timeEnd"`
-	OldestFlapID  *int       `json:"oldestFlapID"`
 	FirstFlapTime *time.Time `json:"firstFlapTime"`
 	LastFlapTime  *time.Time `json:"lastFlapTime"`
+	OldestFlapID  int        `json:"oldestFlapID"`
+}
+
+type Flap struct {
+	Time          time.Time
+	IfOperStatus  int
+	IfAdminStatus int
+}
+
+func (f *Flap) CreateFromDB(r PortRow) {
+	f.Time = r.Time
+
+	// Status stores as string in DB. Applying a workaround
+	if r.IfAdminStatus == ifStatusUpString {
+		f.IfAdminStatus = ifStatusUP
+	} else if r.IfAdminStatus == ifStatusDownString {
+		f.IfAdminStatus = ifStatusDOWN
+	}
+
+	if r.IfOperStatus == ifStatusUpString {
+		f.IfOperStatus = ifStatusUP
+	} else if r.IfOperStatus == ifStatusDownString {
+		f.IfOperStatus = ifStatusDOWN
+	}
 }
 
 type Port struct {
@@ -54,27 +129,36 @@ type Port struct {
 	IsBlacklisted bool       `json:"isBlacklisted"`
 }
 
-func (p *Port) CreateFromDB(e PortDBEntry) {
-	p.IfIndex = e.IfIndex
-	p.IfName = e.IfName
-	p.IfAlias = e.IfAlias
-	p.IfOperStatus = e.IfOperStatus
-	p.FirstFlapTime = &e.Time
-	p.LastFlapTime = &e.Time
+func (p *Port) CreateFromDB(r PortRow) {
+	p.IfIndex = r.IfIndex
+	p.IfName = r.IfName
+	p.IfAlias = r.IfAlias
+	p.FirstFlapTime = &r.Time
+	p.LastFlapTime = &r.Time
 	p.FlapCount = 1
+
+	switch r.IfOperStatus {
+
+	case ifStatusUpString:
+		p.IfOperStatus = ifStatusUpCaption
+
+	case ifStatusDownString:
+		p.IfOperStatus = ifStatusDownCaption
+
+	}
 
 }
 
-func (p *Port) updateFromDB(e PortDBEntry) {
-	if p.IfIndex != e.IfIndex {
+func (p *Port) updateFromDB(r PortRow) {
+	if p.IfIndex != r.IfIndex {
 		panic("Wrong usage of Port.UpdateFromDB")
 	}
 	p.FlapCount++
-	p.IfAlias = e.IfAlias
-	if e.Time.Before(*p.FirstFlapTime) {
-		p.FirstFlapTime = &e.Time
-	} else if e.Time.After(*p.LastFlapTime) {
-		p.LastFlapTime = &e.Time
+	p.IfAlias = r.IfAlias
+	if r.Time.Before(*p.FirstFlapTime) {
+		p.FirstFlapTime = &r.Time
+	} else if r.Time.After(*p.LastFlapTime) {
+		p.LastFlapTime = &r.Time
 	}
 }
 
@@ -84,31 +168,55 @@ type Host struct {
 	Ports     []Port `json:"ports"`
 }
 
-func (h *Host) CreateFromDB(e PortDBEntry) {
-	h.Ipaddress = e.Ipaddress
-	h.Name = e.Hostname
+func (h *Host) CreateFromDB(r PortRow) {
+	h.Ipaddress = r.Ipaddress
+	h.Name = r.Hostname
 	port := Port{}
-	port.CreateFromDB(e)
+	port.CreateFromDB(r)
 	h.Ports = append(h.Ports, port)
 }
 
-func (h *Host) UpdateFromDB(e PortDBEntry) {
-	if h.Ipaddress != e.Ipaddress {
+func (h *Host) UpdateFromDB(r PortRow) {
+	if h.Ipaddress != r.Ipaddress {
 		panic("Wrong usage of Host.UpdateFromDB")
 	}
-	h.Name = e.Hostname
+	h.Name = r.Hostname
 
 	// Decide if we need to update existing port of create new one
 	for i, port := range h.Ports {
-		if port.IfIndex == e.IfIndex {
-			h.Ports[i].updateFromDB(e)
+		if port.IfIndex == r.IfIndex {
+			h.Ports[i].updateFromDB(r)
 			return
 		}
 	}
 	port := Port{}
-	port.CreateFromDB(e)
+	port.CreateFromDB(r)
 	h.Ports = append(h.Ports, port)
 
+}
+
+// FLAPCHART
+
+type FlapsDiagram struct {
+	img *image.RGBA
+}
+
+func (f *FlapsDiagram) drawCol(x int, color color.RGBA) {
+	for y := 0; y < flapChartHeight; y++ {
+		f.img.Set(x, y, color)
+		color.R -= 1
+	}
+}
+
+func CreateFlapsDiagram() *FlapsDiagram {
+
+	upLeft := image.Point{X: 0, Y: 0}
+	lowRight := image.Point{X: flapChartWidth, Y: flapChartHeight}
+
+	flapsDiagram := FlapsDiagram{
+		img: image.NewRGBA(image.Rectangle{Min: upLeft, Max: lowRight}),
+	}
+	return &flapsDiagram
 }
 
 // FLAPPER
@@ -128,40 +236,48 @@ func createFlapper(dsn string) (*Flapper, error) {
 
 }
 
+type Filter struct {
+	PositiveConditions []string
+	NegativeConditions []string
+}
+
+func (f *Filter) ParseFilter(v url.Values) {
+	filter, ok := v["filter"]
+	if !ok {
+		return
+	}
+
+	keywords := strings.Split(filter[0], "") // works incorrect :(
+	for _, kw := range keywords {
+		if strings.HasPrefix("!", kw) {
+			kw := kw[1:]
+			f.NegativeConditions = append(f.NegativeConditions, kw) // replace `!`
+		} else {
+			kw := strings.TrimPrefix(kw, "!")
+			if len(kw) > 0 {
+				f.PositiveConditions = append(f.PositiveConditions, kw)
+			}
+		}
+	}
+}
+
 func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 
 	/*
-		{
-		  "params": {
-		    "timeStart": "2016-01-01 23:00:00",
-		    "timeEnd": "2016-01-02 00:00:00",
-		    "oldestFlapID": "77472",
-		    "firstFlapTime": "2016-01-01 23:10:00",
-		    "lastFlapTime": "2016-01-01 23:59:45"
-		  },
-		  "hosts": [
-		    {
-		      "name": "Chicago-router1",
-		      "ipaddress": "192.168.100.70",
-		      "ports": [
-		        {
-		          "ifIndex": "800",
-		          "ifName": "xe-0\/1\/0",
-		          "ifAlias": "ChicagoMusicExchange",
-		          "ifOperStatus": "up",
-		          "flapCount": "1",
-		          "firstFlapTime": "2016-01-01 23:10:00",
-		          "lastFlapTime": "2016-01-01 23:10:00",
-		          "isBlacklisted": false,
-		          "flaps": []
-		        }
-		     ]
-		   }
-		  ]
-		}
+		SELECT hostname, ipaddress, ifName, ifAlias
+		FROM ports
+
+			AND
+			(hostname LIKE "%1%" OR ipaddress LIKE "%1%" OR ifAlias LIKE "%1%")
+			AND
+			(hostname LIKE "%m9%" OR ipaddress LIKE "%m9%" OR ifAlias LIKE "%m9%")
+			AND NOT
+			(hostname LIKE "%r0%" OR ipaddress LIKE "%r0%" OR ifAlias LIKE "%r0%")
+
+		GROUP BY hostname, ipaddress, ifName, ifAlias;
 	*/
 
-	query := fmt.Sprintf(`SELECT id,
+	SQLQuery := fmt.Sprintf(`SELECT id,
  		sid, 
 		time,
 		timeticks,
@@ -173,7 +289,7 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
  		ifAdminStatus, 
 		ifOperStatus
 		FROM ports 
-		WHERE time >= '%s' AND time <= '%s' 
+		WHERE time >= '%s' AND time <= '%s'
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT 100;`,
 		startTime.Format(timeFormat),
 		endTime.Format(timeFormat),
@@ -189,52 +305,86 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 
 	host := &Host{}
 
-	rows, _ := f.db.Query(query)
-	for rows.Next() {
-		entry := PortDBEntry{}
-		if err := rows.Scan(
-			&entry.Id,
-			&entry.Sid,
-			&entry.Time,
-			&entry.TimeTicks,
-			&entry.Ipaddress,
-			&entry.Hostname,
-			&entry.IfIndex,
-			&entry.IfName,
-			&entry.IfAlias,
-			&entry.IfAdminStatus,
-			&entry.IfOperStatus,
-		); err != nil {
-			log.Fatal(err)
+	for _, portRow := range f.FetchFromDB(SQLQuery) {
+
+		// 0 instead of nil if no flaps because clients crashed seeing null :)
+		if result.Params.OldestFlapID == 0 {
+			result.Params.OldestFlapID = portRow.Id
 		}
-		if result.Params.OldestFlapID == nil {
-			result.Params.OldestFlapID = &entry.Id
-		}
+
 		if result.Params.FirstFlapTime == nil {
-			result.Params.FirstFlapTime = &entry.Time
+			result.Params.FirstFlapTime = &portRow.Time
 		}
-		result.Params.LastFlapTime = &entry.Time
+		result.Params.LastFlapTime = &portRow.Time
 
 		if host.Ipaddress == "" {
-			host.CreateFromDB(entry)
+			host.CreateFromDB(portRow)
 
-		} else if host.Ipaddress == entry.Ipaddress {
-			host.UpdateFromDB(entry)
+		} else if host.Ipaddress == portRow.Ipaddress {
+			host.UpdateFromDB(portRow)
 
 		} else {
 			result.Hosts = append(result.Hosts, *host)
 			host = &Host{}
-			host.CreateFromDB(entry)
+			host.CreateFromDB(portRow)
 
 		}
 
 	}
-
-	//for _, h := range hosts {
-	//	result.Hosts = append(result.Hosts, *h)
-	//}
 	return result, nil
 
+}
+
+func (f *Flapper) FetchFromDB(query string) []PortRow {
+	var portRows []PortRow
+
+	rows, _ := f.db.Query(query)
+	for rows.Next() {
+		portRow := PortRow{}
+		err := rows.Scan(
+			&portRow.Id,
+			&portRow.Sid,
+			&portRow.Time,
+			&portRow.TimeTicks,
+			&portRow.Ipaddress,
+			&portRow.Hostname,
+			&portRow.IfIndex,
+			&portRow.IfName,
+			&portRow.IfAlias,
+			&portRow.IfAdminStatus,
+			&portRow.IfOperStatus,
+		)
+		if err != nil {
+			log.Fatal(err)
+		}
+		portRows = append(portRows, portRow)
+	}
+	return portRows
+}
+
+func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIndex time.Time) []Flap {
+	var flaps []Flap
+
+	SQLQuery := fmt.Sprintf(`SELECT FROM ports 
+		WHERE ipaddress='%s' 
+		AND ifindex=%s AND time >= '%s' 
+		AND time <= '%s'
+		ORDER BY time ASC, timeticks ASC;`,
+		ipAddress,
+		ifIndex,
+		startTime,
+		endTime,
+	)
+
+	entries := f.FetchFromDB(SQLQuery)
+	for _, entry := range entries {
+
+		flap := Flap{}
+		flap.CreateFromDB(entry)
+		flaps = append(flaps, flap)
+	}
+
+	return flaps
 }
 
 // SERVER
@@ -243,16 +393,29 @@ type Server struct {
 	flapper *Flapper
 }
 
-func (s Server) http404(response http.ResponseWriter, request *http.Request) {
+func (s Server) http404(response http.ResponseWriter, message string) {
+	if message == "" {
+		message = "Resource not found"
+	}
 	response.WriteHeader(http.StatusNotFound)
-	response.Write([]byte("Resource not found"))
+	response.Write([]byte(message))
 }
 
-func (s *Server) HandleReview(response http.ResponseWriter, request *http.Request) {
+func (s Server) http400(response http.ResponseWriter, message string) {
 
-	endTime := time.Now()
-	startTime := endTime.Add(-3600 * time.Second)
-	results, err := s.flapper.Review(startTime, endTime)
+	if message == "" {
+		message = "Bad request"
+	}
+
+	response.WriteHeader(http.StatusBadRequest)
+	response.Write([]byte(message))
+}
+
+func (s *Server) HandleReview(response http.ResponseWriter, request *http.Request, q QueryParams) {
+
+	fmt.Println("request.URL.RawQuery: ", request.URL.RawQuery)
+
+	results, err := s.flapper.Review(q.Start, q.End)
 
 	jsonResults, err := json.Marshal(results)
 	if err != nil {
@@ -263,15 +426,145 @@ func (s *Server) HandleReview(response http.ResponseWriter, request *http.Reques
 
 }
 
-func (s *Server) route(response http.ResponseWriter, request *http.Request) {
-	// Fuzzy routing logic caused by bad API design :(
-	if strings.HasPrefix(request.URL.RawQuery, "review") {
-		s.HandleReview(response, request)
-		return
-	} else {
-		s.http404(response, request)
+func (s *Server) HandleCheck(response http.ResponseWriter) {
+	result := CheckResult{CheckResult: "flapmyport"}
+
+	jsonResult, err := json.Marshal(result)
+	if err != nil {
+		response.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	response.Write(jsonResult)
+}
+
+func (s *Server) HandleFlapChart(response http.ResponseWriter, request *http.Request, q QueryParams) {
+
+	//queryData := request.URL.Query()
+
+	//host, ok := queryData["host"]
+	//if !ok {
+	//	s.http400(response, "Parameter `host` is missing")
+	//	return
+	//}
+
+	//ifIndex, ok := queryData[getParamIfIndex]
+	//if !ok {
+	//	s.http400(response, fmt.Sprintf("Parameter `%s` is missing", getParamIfIndex))
+	//	return
+	//}
+	//
+	////fmt.Println(host[0], ifIndex[0])
+
+	flapChart := CreateFlapsDiagram()
+	ColorUp := color.RGBA{R: 205, G: 240, B: 185, A: 0xff}
+	ColorDown := color.RGBA{R: 205, G: 51, B: 51, A: 0xff}
+	ColorFlapping := color.RGBA{R: 255, G: 128, B: 0, A: 0xff}
+	ColorUnknown := color.RGBA{R: 200, G: 200, B: 200, A: 0xff}
+
+	for x := 0; x < flapChartWidth; x++ {
+		currentColor := ColorDown
+		if x < 25 {
+			currentColor = ColorUnknown
+		} else if x < 240 {
+			currentColor = ColorUp
+		} else if x < 300 {
+			currentColor = ColorFlapping
+		} else {
+			currentColor = ColorUp
+		}
+		flapChart.drawCol(x, currentColor)
+	}
+	png.Encode(response, flapChart.img)
+}
+
+func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
+
+	queryParams := QueryParams{
+		Start: time.Now().Add(-defaultReviewInterval),
+		End:   time.Now(),
+		Filter: Filter{
+			PositiveConditions: []string{},
+			NegativeConditions: []string{},
+		},
+	}
+
+	query := request.URL.Query()
+
+	if _, ok := query[actionReview]; ok {
+		queryParams.action = actionReview
+	}
+
+	if _, ok := query[actionFlapHistory]; ok {
+		queryParams.action = actionFlapHistory
+	}
+
+	if _, ok := query[actionFlapChart]; ok {
+		queryParams.action = actionFlapChart
+	}
+
+	if ifIndexStr, ok := query[getParamIfIndex]; ok {
+		queryParams.IfIndex, _ = strconv.Atoi(ifIndexStr[0])
+	}
+
+	if host, ok := query[getParamHost]; ok {
+		queryParams.Host = host[0]
+	}
+
+	if startStr, ok := query[getParamStartTime]; ok {
+		if start, err := time.Parse(timeFormat, startStr[0]); err != nil {
+			return queryParams, err
+
+		} else {
+			queryParams.Start = start
+		}
+	}
+
+	if endStr, ok := query[getParamEndTime]; ok {
+		if end, err := time.Parse(timeFormat, endStr[0]); err != nil {
+			return queryParams, err
+
+		} else {
+			queryParams.End = end
+		}
+	}
+
+	// `start` and `end` are overwritten if `interval` is provided
+	if intervalStr, ok := query[getParamInterval]; ok {
+		interval, err := strconv.Atoi(intervalStr[0])
+		if err == nil {
+			duration := time.Duration(interval) * time.Second
+			queryParams.End = time.Now()
+			queryParams.Start = queryParams.End.Add(-duration)
+		}
+	}
+
+	queryParams.Filter.ParseFilter(request.URL.Query())
+
+	return queryParams, nil
+}
+
+func (s *Server) route(response http.ResponseWriter, request *http.Request) {
+
+	queryParams, err := s.ParseQueryParams(request)
+	if err != nil {
+		s.http404(response, err.Error())
+	}
+
+	switch queryParams.action {
+
+	case actionReview:
+		s.HandleReview(response, request, queryParams)
+
+	case actionFlapChart:
+		s.HandleFlapChart(response, request, queryParams)
+
+	case actionCheck:
+		s.HandleCheck(response)
+
+	default:
+		s.http404(response, "Unknown action")
+	}
+
 }
 
 // MAIN
