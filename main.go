@@ -20,6 +20,7 @@ const (
 	timeFormat      = "2006-01-02 15:04:05"
 	flapChartWidth  = 333
 	flapChartHeight = 10
+	sqlRowsLimit    = 100000
 
 	ifStatusUP          = 1
 	ifStatusDOWN        = 2
@@ -43,15 +44,14 @@ const (
 	getParamFilter    = "filter"
 )
 
+var ColorUp = color.RGBA{R: 10, G: 178, B: 38, A: 0xff}
+var ColorUpState = color.RGBA{R: 125, G: 212, B: 139, A: 0xff}
+var ColorDown = color.RGBA{R: 212, G: 57, B: 57, A: 0xff}
+var ColorDownState = color.RGBA{R: 239, G: 106, B: 106, A: 0xff}
+var ColorFlapping = color.RGBA{R: 255, G: 128, B: 0, A: 0xff}
+var ColorUnknown = color.RGBA{R: 200, G: 200, B: 200, A: 0xff}
+
 // DATA FORMATS
-
-type FMPTime time.Time
-
-func (f FMPTime) MarshalJSON() ([]byte, error) {
-	time := time.Time(f).Format(timeFormat)
-	timeStr := fmt.Sprintf(time)
-	return []byte(timeStr), nil
-}
 
 type CheckResult struct {
 	CheckResult string `json:"checkResult"`
@@ -79,6 +79,30 @@ type PortRow struct {
 	IfAlias       string
 	IfAdminStatus string
 	IfOperStatus  string
+}
+
+func (p *PortRow) CreateFlap() Flap {
+	flap := Flap{
+		Time: p.Time,
+	}
+
+	// Status stores as string in DB. Applying a workaround
+	switch p.IfAdminStatus {
+	case ifStatusUpString:
+		flap.IfAdminStatus = ifStatusUP
+	case ifStatusDownString:
+		flap.IfAdminStatus = ifStatusDOWN
+	}
+
+	switch p.IfOperStatus {
+	case ifStatusUpString:
+		flap.IfOperStatus = ifStatusUP
+	case ifStatusDownString:
+		flap.IfOperStatus = ifStatusDOWN
+	}
+
+	return flap
+
 }
 
 // ReviewResult is a structure
@@ -290,9 +314,10 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 		ifOperStatus
 		FROM ports 
 		WHERE time >= '%s' AND time <= '%s'
-		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT 100;`,
+		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT %d;`,
 		startTime.Format(timeFormat),
 		endTime.Format(timeFormat),
+		sqlRowsLimit,
 	)
 
 	result := ReviewResult{
@@ -331,6 +356,9 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 		}
 
 	}
+	if host.Ipaddress != "" {
+		result.Hosts = append(result.Hosts, *host)
+	}
 	return result, nil
 
 }
@@ -362,29 +390,136 @@ func (f *Flapper) FetchFromDB(query string) []PortRow {
 	return portRows
 }
 
-func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIndex time.Time) []Flap {
-	var flaps []Flap
+func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIndex int) []Flap {
 
-	SQLQuery := fmt.Sprintf(`SELECT FROM ports 
-		WHERE ipaddress='%s' 
-		AND ifindex=%s AND time >= '%s' 
-		AND time <= '%s'
-		ORDER BY time ASC, timeticks ASC;`,
+	SQLQuery := fmt.Sprintf(`SELECT id,
+ 		sid, 
+		time,
+		timeticks,
+		ipaddress, 
+		hostname, 
+		ifIndex, 
+		ifName, 
+		ifAlias, 
+ 		ifAdminStatus, 
+		ifOperStatus
+		FROM ports 
+		WHERE time >= '%s' AND time <= '%s' AND ipaddress = '%s' AND ifIndex = %d
+		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT 100;`,
+		startTime.Format(timeFormat),
+		endTime.Format(timeFormat),
 		ipAddress,
 		ifIndex,
-		startTime,
-		endTime,
 	)
 
-	entries := f.FetchFromDB(SQLQuery)
-	for _, entry := range entries {
-
-		flap := Flap{}
-		flap.CreateFromDB(entry)
-		flaps = append(flaps, flap)
+	var flaps []Flap
+	for _, entry := range f.FetchFromDB(SQLQuery) {
+		flaps = append(flaps, entry.CreateFlap())
 	}
 
 	return flaps
+}
+
+func (f *Flapper) FlapChart(q QueryParams) *FlapsDiagram {
+
+	/*
+		12:00			 13:00
+		3600         1800          0 3600/333=10.81  1800/10.81 = 166
+		 40          20/           0. 40/333=0.12012 20/0.1201 = 166
+		 500	     250          0
+		 [0 0 0 0 1 1 1 0 0 0 1 1 1]
+		333          160          0.  500/333 = 1.5 250 / 1.5 = 166
+
+		Cent := intervalSeconds / 333
+		y := flapSecond / Cent
+
+	*/
+
+	intervalSeconds := q.End.Unix() - q.Start.Unix()
+	cent := float64(intervalSeconds) / flapChartWidth
+
+	timeLine := make([]int, flapChartWidth)
+
+	EnumUnknown := 0
+	EnumUp := 1
+	EnumDown := 2
+	EnumFlappingUp := 3
+	EnumFlappingDown := 4
+
+	flaps := f.PortFlaps(q.Start, q.End, q.Host, q.IfIndex)
+
+	status := EnumUnknown
+
+	for _, flap := range flaps {
+
+		if status == EnumUnknown {
+			if flap.IfOperStatus == ifStatusUP {
+				status = EnumDown
+			} else {
+				status = EnumUp
+			}
+		}
+
+		secondsFromStart := flap.Time.Unix() - q.Start.Unix()
+		floatX := float64(secondsFromStart) / cent
+		x := int(floatX)
+
+		val := timeLine[x]
+		if val == EnumUnknown {
+			if flap.IfOperStatus == ifStatusUP {
+				timeLine[x] = EnumUp
+			} else {
+				timeLine[x] = EnumDown
+			}
+		} else {
+			if flap.IfOperStatus == ifStatusUP {
+				timeLine[x] = EnumFlappingUp
+			} else {
+				timeLine[x] = EnumFlappingDown
+			}
+
+		}
+	}
+
+	// Fill timeline with colors
+	colorLine := make([]color.RGBA, flapChartWidth)
+
+	for i, enum := range timeLine {
+		switch enum {
+		case EnumUnknown:
+			if status == EnumUp {
+				colorLine[i] = ColorUpState
+			} else if status == EnumDown {
+				colorLine[i] = ColorDownState
+			} else {
+				colorLine[i] = ColorUnknown
+			}
+
+		case EnumUp:
+			colorLine[i] = ColorUp
+			status = EnumUp
+
+		case EnumDown:
+			colorLine[i] = ColorDown
+			status = EnumDown
+
+		case EnumFlappingUp:
+			colorLine[i] = ColorFlapping
+			status = EnumUp
+
+		case EnumFlappingDown:
+			colorLine[i] = ColorFlapping
+			status = EnumDown
+
+		}
+	}
+
+	flapsDiagram := CreateFlapsDiagram()
+
+	for x, currentColor := range colorLine {
+		flapsDiagram.drawCol(x, currentColor)
+	}
+	return flapsDiagram
 }
 
 // SERVER
@@ -413,8 +548,6 @@ func (s Server) http400(response http.ResponseWriter, message string) {
 
 func (s *Server) HandleReview(response http.ResponseWriter, request *http.Request, q QueryParams) {
 
-	fmt.Println("request.URL.RawQuery: ", request.URL.RawQuery)
-
 	results, err := s.flapper.Review(q.Start, q.End)
 
 	jsonResults, err := json.Marshal(results)
@@ -439,49 +572,30 @@ func (s *Server) HandleCheck(response http.ResponseWriter) {
 
 func (s *Server) HandleFlapChart(response http.ResponseWriter, request *http.Request, q QueryParams) {
 
-	//queryData := request.URL.Query()
-
-	//host, ok := queryData["host"]
-	//if !ok {
-	//	s.http400(response, "Parameter `host` is missing")
-	//	return
-	//}
-
-	//ifIndex, ok := queryData[getParamIfIndex]
-	//if !ok {
-	//	s.http400(response, fmt.Sprintf("Parameter `%s` is missing", getParamIfIndex))
-	//	return
-	//}
-	//
-	////fmt.Println(host[0], ifIndex[0])
-
-	flapChart := CreateFlapsDiagram()
-	ColorUp := color.RGBA{R: 205, G: 240, B: 185, A: 0xff}
-	ColorDown := color.RGBA{R: 205, G: 51, B: 51, A: 0xff}
-	ColorFlapping := color.RGBA{R: 255, G: 128, B: 0, A: 0xff}
-	ColorUnknown := color.RGBA{R: 200, G: 200, B: 200, A: 0xff}
-
-	for x := 0; x < flapChartWidth; x++ {
-		currentColor := ColorDown
-		if x < 25 {
-			currentColor = ColorUnknown
-		} else if x < 240 {
-			currentColor = ColorUp
-		} else if x < 300 {
-			currentColor = ColorFlapping
-		} else {
-			currentColor = ColorUp
-		}
-		flapChart.drawCol(x, currentColor)
+	queryParams, err := s.ParseQueryParams(request)
+	if err != nil {
+		return
 	}
+
+	if queryParams.Host == "" {
+		s.http404(response, "Host not given")
+		return
+	}
+	if queryParams.IfIndex == 0 {
+		s.http404(response, "Host not given")
+		return
+	}
+
+	flapChart := s.flapper.FlapChart(queryParams)
+
 	png.Encode(response, flapChart.img)
 }
 
 func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 
 	queryParams := QueryParams{
-		Start: time.Now().Add(-defaultReviewInterval),
-		End:   time.Now(),
+		Start: time.Now().UTC().Add(-defaultReviewInterval),
+		End:   time.Now().UTC(),
 		Filter: Filter{
 			PositiveConditions: []string{},
 			NegativeConditions: []string{},
@@ -533,7 +647,7 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 		interval, err := strconv.Atoi(intervalStr[0])
 		if err == nil {
 			duration := time.Duration(interval) * time.Second
-			queryParams.End = time.Now()
+			queryParams.End = time.Now().UTC()
 			queryParams.Start = queryParams.End.Add(-duration)
 		}
 	}
