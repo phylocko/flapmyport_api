@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/BurntSushi/toml"
 	_ "github.com/go-sql-driver/mysql"
 	"image"
 	"image/color"
@@ -17,6 +18,16 @@ import (
 )
 
 const (
+	// Settings
+	defaultConfigFilename = "settings.conf"
+	defaultListenAddress  = "0.0.0.0"
+	defaultLogFilename    = "flapmyport_api.log"
+	defaultListenPort     = 8080
+	defaultDBHost         = "localhost"
+	defaultDBUser         = "root"
+	defaultDBName         = "snmpflapd"
+	defaultDBPassword     = ""
+
 	timeFormat      = "2006-01-02 15:04:05"
 	flapChartWidth  = 333
 	flapChartHeight = 10
@@ -43,6 +54,26 @@ const (
 	getParamInterval  = "interval"
 	getParamFilter    = "filter"
 )
+
+type Config struct {
+	LogFilename   string
+	ListenAddress string
+	ListenPort    int
+	DBHost        string
+	DBName        string
+	DBUser        string
+	DBPassword    string
+}
+
+func (c *Config) SqlDSN() string {
+	return fmt.Sprintf(
+		"%s:%s@tcp(%s)/%s?parseTime=true",
+		c.DBUser,
+		c.DBPassword,
+		c.DBHost,
+		c.DBName,
+	)
+}
 
 var ColorUp = color.RGBA{R: 10, G: 178, B: 38, A: 0xff}
 var ColorUpState = color.RGBA{R: 125, G: 212, B: 139, A: 0xff}
@@ -604,6 +635,10 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 
 	query := request.URL.Query()
 
+	if _, ok := query[actionCheck]; ok {
+		queryParams.action = actionCheck
+	}
+
 	if _, ok := query[actionReview]; ok {
 		queryParams.action = actionReview
 	}
@@ -681,10 +716,32 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 
 }
 
+func loadConfig() Config {
+	var config = Config{
+		LogFilename:   defaultLogFilename,
+		ListenAddress: defaultListenAddress,
+		ListenPort:    defaultListenPort,
+		DBHost:        defaultDBHost,
+		DBName:        defaultDBName,
+		DBUser:        defaultDBUser,
+		DBPassword:    defaultDBPassword,
+	}
+
+	_, err := toml.DecodeFile(defaultConfigFilename, &config)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return config
+
+}
+
 // MAIN
 
 func main() {
-	flapper, err := createFlapper("developer:0o9i8u@tcp(localhost)/traps?parseTime=true")
+
+	config := loadConfig()
+	flapper, err := createFlapper(config.SqlDSN())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -692,5 +749,10 @@ func main() {
 	s := Server{flapper: flapper}
 
 	http.HandleFunc("/", s.route)
-	http.ListenAndServe(":8080", nil)
+
+	// Нормально ли, что здесь err криво наследует тип от err выше? Как пишут крутые чуваки?
+	err = http.ListenAndServe(fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
