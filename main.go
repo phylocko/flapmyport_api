@@ -75,12 +75,14 @@ func (c *Config) SqlDSN() string {
 	)
 }
 
-var ColorUp = color.RGBA{R: 10, G: 178, B: 38, A: 0xff}
-var ColorUpState = color.RGBA{R: 125, G: 212, B: 139, A: 0xff}
-var ColorDown = color.RGBA{R: 212, G: 57, B: 57, A: 0xff}
-var ColorDownState = color.RGBA{R: 239, G: 106, B: 106, A: 0xff}
-var ColorFlapping = color.RGBA{R: 255, G: 128, B: 0, A: 0xff}
-var ColorUnknown = color.RGBA{R: 200, G: 200, B: 200, A: 0xff}
+var (
+	ColorUp        = color.RGBA{R: 10, G: 178, B: 38, A: 0xff}
+	ColorUpState   = color.RGBA{R: 125, G: 212, B: 139, A: 0xff}
+	ColorDown      = color.RGBA{R: 212, G: 57, B: 57, A: 0xff}
+	ColorDownState = color.RGBA{R: 239, G: 106, B: 106, A: 0xff}
+	ColorFlapping  = color.RGBA{R: 255, G: 128, B: 0, A: 0xff}
+	ColorUnknown   = color.RGBA{R: 200, G: 200, B: 200, A: 0xff}
+)
 
 // DATA FORMATS
 
@@ -259,7 +261,6 @@ type FlapsDiagram struct {
 func (f *FlapsDiagram) drawCol(x int, color color.RGBA) {
 	for y := 0; y < flapChartHeight; y++ {
 		f.img.Set(x, y, color)
-		color.R -= 1
 	}
 }
 
@@ -467,7 +468,7 @@ func (f *Flapper) FlapChart(q QueryParams) *FlapsDiagram {
 	*/
 
 	intervalSeconds := q.End.Unix() - q.Start.Unix()
-	cent := float64(intervalSeconds) / flapChartWidth
+	cent := float64(intervalSeconds) / (flapChartWidth - 1)
 
 	timeLine := make([]int, flapChartWidth)
 
@@ -738,20 +739,28 @@ func loadConfig() Config {
 
 // MAIN
 
+func createServer(c Config) (*Server, error) {
+	flapper, err := createFlapper(c.SqlDSN())
+	if err != nil {
+		return nil, err
+	}
+	s := Server{flapper: flapper}
+	return &s, nil
+}
+
 func main() {
 
 	config := loadConfig()
-	flapper, err := createFlapper(config.SqlDSN())
+
+	s, err := createServer(config)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	s := Server{flapper: flapper}
-
 	http.HandleFunc("/", s.route)
 
 	// Нормально ли, что здесь err криво наследует тип от err выше? Как пишут крутые чуваки?
-	err = http.ListenAndServe(fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort), nil)
+	listenSocket := fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort)
+	err = http.ListenAndServe(listenSocket, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
