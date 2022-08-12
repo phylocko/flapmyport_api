@@ -4,21 +4,23 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	_ "github.com/go-sql-driver/mysql"
 	"image"
 	"image/color"
 	"image/png"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	_ "github.com/go-sql-driver/mysql"
 )
 
+// Settings
 const (
-	// Settings
 	defaultConfigFilename = "settings.conf"
 	defaultListenAddress  = "0.0.0.0"
 	defaultLogFilename    = "flapmyport_api.log"
@@ -27,32 +29,27 @@ const (
 	defaultDBUser         = "root"
 	defaultDBName         = "snmpflapd"
 	defaultDBPassword     = ""
-
-	timeFormat      = "2006-01-02 15:04:05"
-	flapChartWidth  = 333
-	flapChartHeight = 10
-	sqlRowsLimit    = 100000
-
-	ifStatusUP          = 1
-	ifStatusDOWN        = 2
-	ifStatusUpString    = "1"
-	ifStatusDownString  = "2"
-	ifStatusUpCaption   = "up"
-	ifStatusDownCaption = "down"
-
-	actionReview      = "review"
-	actionFlapChart   = "flapchart"
-	actionFlapHistory = "flaphistory"
-	actionCheck       = "check"
-
+	timeFormat            = "2006-01-02 15:04:05"
+	flapChartWidth        = 333
+	flapChartHeight       = 10
+	sqlRowsLimit          = 100000
+	ifStatusUP            = 1
+	ifStatusDOWN          = 2
+	ifStatusUpString      = "1"
+	ifStatusDownString    = "2"
+	ifStatusUpCaption     = "up"
+	ifStatusDownCaption   = "down"
+	actionReview          = "review"
+	actionFlapChart       = "flapchart"
+	actionFlapHistory     = "flaphistory"
+	actionCheck           = "check"
 	defaultReviewInterval = time.Hour
-
-	getParamIfIndex   = "ifindex"
-	getParamHost      = "host"
-	getParamStartTime = "start"
-	getParamEndTime   = "end"
-	getParamInterval  = "interval"
-	getParamFilter    = "filter"
+	getParamIfIndex       = "ifindex"
+	getParamHost          = "host"
+	getParamStartTime     = "start"
+	getParamEndTime       = "end"
+	getParamInterval      = "interval"
+	getParamFilter        = "filter"
 )
 
 type Config struct {
@@ -63,6 +60,16 @@ type Config struct {
 	DBName        string
 	DBUser        string
 	DBPassword    string
+}
+
+var config = Config{
+	LogFilename:   defaultLogFilename,
+	ListenAddress: defaultListenAddress,
+	ListenPort:    defaultListenPort,
+	DBHost:        defaultDBHost,
+	DBName:        defaultDBName,
+	DBUser:        defaultDBUser,
+	DBPassword:    defaultDBPassword,
 }
 
 func (c *Config) SqlDSN() string {
@@ -101,44 +108,26 @@ type QueryParams struct {
 
 // PortRow is a DB row representation
 type PortRow struct {
-	Id            int
-	Sid           string
-	Time          time.Time
-	TimeTicks     int64
-	Ipaddress     string
-	Hostname      string
-	IfIndex       int
-	IfName        string
-	IfAlias       string
-	IfAdminStatus string
-	IfOperStatus  string
+	Id           int
+	Sid          string
+	Time         time.Time
+	TimeTicks    int64
+	Ipaddress    string
+	Hostname     string
+	IfIndex      int
+	IfName       string
+	IfAlias      string
+	IfOperStatus int
 }
 
 func (p *PortRow) CreateFlap() Flap {
-	flap := Flap{
-		Time: p.Time,
+	return Flap{
+		Time:         p.Time,
+		IfOperStatus: p.IfOperStatus,
 	}
-
-	// Status stores as string in DB. Applying a workaround
-	switch p.IfAdminStatus {
-	case ifStatusUpString:
-		flap.IfAdminStatus = ifStatusUP
-	case ifStatusDownString:
-		flap.IfAdminStatus = ifStatusDOWN
-	}
-
-	switch p.IfOperStatus {
-	case ifStatusUpString:
-		flap.IfOperStatus = ifStatusUP
-	case ifStatusDownString:
-		flap.IfOperStatus = ifStatusDOWN
-	}
-
-	return flap
 
 }
 
-// ReviewResult is a structure
 type ReviewResult struct {
 	Params Params `json:"params"`
 	Hosts  []Host `json:"hosts"`
@@ -153,29 +142,16 @@ type Params struct {
 }
 
 type Flap struct {
-	Time          time.Time
-	IfOperStatus  int
-	IfAdminStatus int
+	Time         time.Time
+	IfOperStatus int
 }
 
-func (f *Flap) CreateFromDB(r PortRow) {
-	f.Time = r.Time
-
-	// Status stores as string in DB. Applying a workaround
-	if r.IfAdminStatus == ifStatusUpString {
-		f.IfAdminStatus = ifStatusUP
-	} else if r.IfAdminStatus == ifStatusDownString {
-		f.IfAdminStatus = ifStatusDOWN
-	}
-
-	if r.IfOperStatus == ifStatusUpString {
-		f.IfOperStatus = ifStatusUP
-	} else if r.IfOperStatus == ifStatusDownString {
-		f.IfOperStatus = ifStatusDOWN
-	}
+func (flap *Flap) FromDB(row PortRow) {
+	flap.Time = row.Time
+	flap.IfOperStatus = row.IfOperStatus
 }
 
-type Port struct {
+type PortView struct {
 	IfIndex       int        `json:"ifIndex"`
 	IfName        string     `json:"ifName"`
 	IfAlias       string     `json:"ifAlias"`
@@ -186,7 +162,7 @@ type Port struct {
 	IsBlacklisted bool       `json:"isBlacklisted"`
 }
 
-func (p *Port) CreateFromDB(r PortRow) {
+func (p *PortView) FromDB(r PortRow) {
 	p.IfIndex = r.IfIndex
 	p.IfName = r.IfName
 	p.IfAlias = r.IfAlias
@@ -194,21 +170,19 @@ func (p *Port) CreateFromDB(r PortRow) {
 	p.LastFlapTime = &r.Time
 	p.FlapCount = 1
 
-	switch r.IfOperStatus {
-
-	case ifStatusUpString:
+	if r.IfOperStatus == ifStatusUP {
 		p.IfOperStatus = ifStatusUpCaption
 
-	case ifStatusDownString:
+	} else if r.IfOperStatus == ifStatusDOWN {
 		p.IfOperStatus = ifStatusDownCaption
 
 	}
 
 }
 
-func (p *Port) updateFromDB(r PortRow) {
+func (p *PortView) updateFromDB(r PortRow) {
 	if p.IfIndex != r.IfIndex {
-		panic("Wrong usage of Port.UpdateFromDB")
+		panic("Wrong usage of PortView.UpdateFromDB")
 	}
 	p.FlapCount++
 	p.IfAlias = r.IfAlias
@@ -217,19 +191,27 @@ func (p *Port) updateFromDB(r PortRow) {
 	} else if r.Time.After(*p.LastFlapTime) {
 		p.LastFlapTime = &r.Time
 	}
+	if r.IfOperStatus == ifStatusUP {
+		p.IfOperStatus = ifStatusUpCaption
+
+	} else if r.IfOperStatus == ifStatusDOWN {
+		p.IfOperStatus = ifStatusDownCaption
+
+	}
+
 }
 
 type Host struct {
-	Name      string `json:"name"`
-	Ipaddress string `json:"ipaddress"`
-	Ports     []Port `json:"ports"`
+	Name      string     `json:"name"`
+	Ipaddress string     `json:"ipaddress"`
+	Ports     []PortView `json:"ports"`
 }
 
-func (h *Host) CreateFromDB(r PortRow) {
+func (h *Host) FromDB(r PortRow) {
 	h.Ipaddress = r.Ipaddress
 	h.Name = r.Hostname
-	port := Port{}
-	port.CreateFromDB(r)
+	port := PortView{}
+	port.FromDB(r)
 	h.Ports = append(h.Ports, port)
 }
 
@@ -246,8 +228,8 @@ func (h *Host) UpdateFromDB(r PortRow) {
 			return
 		}
 	}
-	port := Port{}
-	port.CreateFromDB(r)
+	port := PortView{}
+	port.FromDB(r)
 	h.Ports = append(h.Ports, port)
 
 }
@@ -293,8 +275,7 @@ func createFlapper(dsn string) (*Flapper, error) {
 }
 
 type Filter struct {
-	PositiveConditions []string
-	NegativeConditions []string
+	Conditions []string
 }
 
 func (f *Filter) ParseFilter(v url.Values) {
@@ -303,35 +284,36 @@ func (f *Filter) ParseFilter(v url.Values) {
 		return
 	}
 
-	keywords := strings.Split(filter[0], "") // works incorrect :(
+	keywords := strings.Fields(filter[0])
 	for _, kw := range keywords {
-		if strings.HasPrefix("!", kw) {
-			kw := kw[1:]
-			f.NegativeConditions = append(f.NegativeConditions, kw) // replace `!`
-		} else {
-			kw := strings.TrimPrefix(kw, "!")
-			if len(kw) > 0 {
-				f.PositiveConditions = append(f.PositiveConditions, kw)
+		if strings.HasPrefix(kw, "!") {
+			if len(kw) < 2 {
+				continue
 			}
+			kw = kw[1:]
+			condition := fmt.Sprintf(`AND (hostname 
+				NOT LIKE "%%%[1]s%%" AND ipaddress 
+				NOT LIKE "%%%[1]s%%" AND ifAlias 
+				NOT LIKE "%%%[1]s%%")`,
+				kw,
+			)
+			f.Conditions = append(f.Conditions, condition)
+
+		} else {
+			condition := fmt.Sprintf(`AND (hostname 
+			LIKE "%%%[1]s%%" OR ipaddress 
+			LIKE "%%%[1]s%%" OR ifAlias 
+			LIKE "%%%[1]s%%")`,
+				kw,
+			)
+			f.Conditions = append(f.Conditions, condition)
+
 		}
+
 	}
 }
 
-func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
-
-	/*
-		SELECT hostname, ipaddress, ifName, ifAlias
-		FROM ports
-
-			AND
-			(hostname LIKE "%1%" OR ipaddress LIKE "%1%" OR ifAlias LIKE "%1%")
-			AND
-			(hostname LIKE "%m9%" OR ipaddress LIKE "%m9%" OR ifAlias LIKE "%m9%")
-			AND NOT
-			(hostname LIKE "%r0%" OR ipaddress LIKE "%r0%" OR ifAlias LIKE "%r0%")
-
-		GROUP BY hostname, ipaddress, ifName, ifAlias;
-	*/
+func (f *Flapper) Review(startTime, endTime time.Time, filter Filter) (ReviewResult, error) {
 
 	SQLQuery := fmt.Sprintf(`SELECT id,
  		sid, 
@@ -342,13 +324,14 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 		ifIndex, 
 		ifName, 
 		ifAlias, 
- 		ifAdminStatus, 
 		ifOperStatus
 		FROM ports 
 		WHERE time >= '%s' AND time <= '%s'
+		%s
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT %d;`,
 		startTime.Format(timeFormat),
 		endTime.Format(timeFormat),
+		strings.Join(filter.Conditions, " "),
 		sqlRowsLimit,
 	)
 
@@ -375,7 +358,7 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 		result.Params.LastFlapTime = &portRow.Time
 
 		if host.Ipaddress == "" {
-			host.CreateFromDB(portRow)
+			host.FromDB(portRow)
 
 		} else if host.Ipaddress == portRow.Ipaddress {
 			host.UpdateFromDB(portRow)
@@ -383,7 +366,7 @@ func (f *Flapper) Review(startTime, endTime time.Time) (ReviewResult, error) {
 		} else {
 			result.Hosts = append(result.Hosts, *host)
 			host = &Host{}
-			host.CreateFromDB(portRow)
+			host.FromDB(portRow)
 
 		}
 
@@ -411,7 +394,6 @@ func (f *Flapper) FetchFromDB(query string) []PortRow {
 			&portRow.IfIndex,
 			&portRow.IfName,
 			&portRow.IfAlias,
-			&portRow.IfAdminStatus,
 			&portRow.IfOperStatus,
 		)
 		if err != nil {
@@ -433,7 +415,6 @@ func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIn
 		ifIndex, 
 		ifName, 
 		ifAlias, 
- 		ifAdminStatus, 
 		ifOperStatus
 		FROM ports 
 		WHERE time >= '%s' AND time <= '%s' AND ipaddress = '%s' AND ifIndex = %d
@@ -560,11 +541,8 @@ type Server struct {
 	flapper *Flapper
 }
 
-func (s Server) http404(response http.ResponseWriter, message string) {
-	if message == "" {
-		message = "Resource not found"
-	}
-	response.WriteHeader(http.StatusNotFound)
+func (s Server) Index(response http.ResponseWriter) {
+	message := "FlapMyPort API is ready"
 	response.Write([]byte(message))
 }
 
@@ -573,14 +551,13 @@ func (s Server) http400(response http.ResponseWriter, message string) {
 	if message == "" {
 		message = "Bad request"
 	}
-
 	response.WriteHeader(http.StatusBadRequest)
 	response.Write([]byte(message))
 }
 
 func (s *Server) HandleReview(response http.ResponseWriter, request *http.Request, q QueryParams) {
 
-	results, err := s.flapper.Review(q.Start, q.End)
+	results, _ := s.flapper.Review(q.Start, q.End, q.Filter)
 
 	jsonResults, err := json.Marshal(results)
 	if err != nil {
@@ -610,11 +587,11 @@ func (s *Server) HandleFlapChart(response http.ResponseWriter, request *http.Req
 	}
 
 	if queryParams.Host == "" {
-		s.http404(response, "Host not given")
+		s.http400(response, "Host not given")
 		return
 	}
 	if queryParams.IfIndex == 0 {
-		s.http404(response, "Host not given")
+		s.http400(response, "Host not given")
 		return
 	}
 
@@ -629,8 +606,7 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 		Start: time.Now().UTC().Add(-defaultReviewInterval),
 		End:   time.Now().UTC(),
 		Filter: Filter{
-			PositiveConditions: []string{},
-			NegativeConditions: []string{},
+			Conditions: []string{},
 		},
 	}
 
@@ -661,20 +637,22 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 	}
 
 	if startStr, ok := query[getParamStartTime]; ok {
-		if start, err := time.Parse(timeFormat, startStr[0]); err != nil {
-			return queryParams, err
-
-		} else {
-			queryParams.Start = start
+		if startStr[0] != "" {
+			if start, err := time.Parse(timeFormat, startStr[0]); err != nil {
+				return queryParams, err
+			} else {
+				queryParams.Start = start
+			}
 		}
 	}
 
 	if endStr, ok := query[getParamEndTime]; ok {
-		if end, err := time.Parse(timeFormat, endStr[0]); err != nil {
-			return queryParams, err
-
-		} else {
-			queryParams.End = end
+		if endStr[0] != "" {
+			if end, err := time.Parse(timeFormat, endStr[0]); err != nil {
+				return queryParams, err
+			} else {
+				queryParams.End = end
+			}
 		}
 	}
 
@@ -697,7 +675,8 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 
 	queryParams, err := s.ParseQueryParams(request)
 	if err != nil {
-		s.http404(response, err.Error())
+		s.http400(response, err.Error())
+		return
 	}
 
 	switch queryParams.action {
@@ -712,32 +691,68 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 		s.HandleCheck(response)
 
 	default:
-		s.http404(response, "Unknown action")
+		s.Index(response)
 	}
 
 }
 
-func loadConfig() Config {
-	var config = Config{
-		LogFilename:   defaultLogFilename,
-		ListenAddress: defaultListenAddress,
-		ListenPort:    defaultListenPort,
-		DBHost:        defaultDBHost,
-		DBName:        defaultDBName,
-		DBUser:        defaultDBUser,
-		DBPassword:    defaultDBPassword,
-	}
+func readConfigFile() {
 
 	_, err := toml.DecodeFile(defaultConfigFilename, &config)
 	if err != nil {
-		log.Fatal(err)
+		msg := fmt.Sprintf("%s not found. Suppose we're using environment variables", defaultConfigFilename)
+		fmt.Println(msg)
+		log.Println(msg)
+	}
+}
+
+func readConfigEnv() {
+
+	if logFilename, exists := os.LookupEnv("LOGFILE"); exists {
+		config.LogFilename = logFilename
 	}
 
-	return config
+	if listenAddress, exists := os.LookupEnv("LISTEN_ADDRESS"); exists {
+		config.ListenAddress = listenAddress
+	}
 
+	if listenPort, exists := os.LookupEnv("LISTEN_PORT"); exists {
+		if intPort, error := strconv.Atoi(listenPort); error != nil {
+			msg := "Wrong environment variable LISTEN_PORT"
+			fmt.Println(msg)
+			log.Fatalln(msg)
+
+		} else {
+			config.ListenPort = intPort
+		}
+
+	}
+
+	if dbHost, exists := os.LookupEnv("DBHOST"); exists {
+		config.DBHost = dbHost
+	}
+
+	if dbName, exists := os.LookupEnv("DBNAME"); exists {
+		config.DBName = dbName
+	}
+
+	if dbUser, exists := os.LookupEnv("DBUSER"); exists {
+		config.DBUser = dbUser
+	}
+
+	if dbPassword, exists := os.LookupEnv("DBPASSWORD"); exists {
+		config.DBPassword = dbPassword
+	}
 }
 
 // MAIN
+
+func init() {
+
+	readConfigFile()
+	readConfigEnv()
+
+}
 
 func createServer(c Config) (*Server, error) {
 	flapper, err := createFlapper(c.SqlDSN())
@@ -750,15 +765,18 @@ func createServer(c Config) (*Server, error) {
 
 func main() {
 
-	config := loadConfig()
+	// TODO: enable logging
 
 	s, err := createServer(config)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	msg := fmt.Sprintf("Listening on %s:%d", config.ListenAddress, config.ListenPort)
+	fmt.Println(msg)
+
 	http.HandleFunc("/", s.route)
 
-	// Нормально ли, что здесь err криво наследует тип от err выше? Как пишут крутые чуваки?
 	listenSocket := fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort)
 	err = http.ListenAndServe(listenSocket, nil)
 	if err != nil {
