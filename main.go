@@ -1,8 +1,11 @@
+// Copyright 2022 Vladislav Pavkin
+
 package main
 
 import (
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -33,10 +36,6 @@ const (
 	flapChartWidth        = 333
 	flapChartHeight       = 10
 	sqlRowsLimit          = 100000
-	ifStatusUP            = 1
-	ifStatusDOWN          = 2
-	ifStatusUpString      = "1"
-	ifStatusDownString    = "2"
 	ifStatusUpCaption     = "up"
 	ifStatusDownCaption   = "down"
 	actionReview          = "review"
@@ -83,6 +82,13 @@ func (c *Config) SqlDSN() string {
 }
 
 var (
+	// flags
+	version            string
+	build              string
+	flagVerbose        bool
+	flagConfigFilename string
+	flagVersion        bool
+
 	ColorUp        = color.RGBA{R: 10, G: 178, B: 38, A: 0xff}
 	ColorUpState   = color.RGBA{R: 125, G: 212, B: 139, A: 0xff}
 	ColorDown      = color.RGBA{R: 212, G: 57, B: 57, A: 0xff}
@@ -115,9 +121,9 @@ type PortRow struct {
 	Ipaddress    string
 	Hostname     string
 	IfIndex      int
-	IfName       string
-	IfAlias      string
-	IfOperStatus int
+	IfName       *string
+	IfAlias      *string
+	IfOperStatus string
 }
 
 func (p *PortRow) CreateFlap() Flap {
@@ -143,7 +149,7 @@ type Params struct {
 
 type Flap struct {
 	Time         time.Time
-	IfOperStatus int
+	IfOperStatus string
 }
 
 func (flap *Flap) FromDB(row PortRow) {
@@ -164,20 +170,21 @@ type PortView struct {
 
 func (p *PortView) FromDB(r PortRow) {
 	p.IfIndex = r.IfIndex
-	p.IfName = r.IfName
-	p.IfAlias = r.IfAlias
+
+	if r.IfName == nil {
+		p.IfName = fmt.Sprintf("<ifIndex %d>", r.IfIndex)
+	} else {
+		p.IfName = *r.IfName
+	}
+
+	if r.IfAlias != nil {
+		p.IfAlias = *r.IfAlias
+	}
+
 	p.FirstFlapTime = &r.Time
 	p.LastFlapTime = &r.Time
 	p.FlapCount = 1
-
-	if r.IfOperStatus == ifStatusUP {
-		p.IfOperStatus = ifStatusUpCaption
-
-	} else if r.IfOperStatus == ifStatusDOWN {
-		p.IfOperStatus = ifStatusDownCaption
-
-	}
-
+	p.IfOperStatus = r.IfOperStatus
 }
 
 func (p *PortView) updateFromDB(r PortRow) {
@@ -185,20 +192,15 @@ func (p *PortView) updateFromDB(r PortRow) {
 		panic("Wrong usage of PortView.UpdateFromDB")
 	}
 	p.FlapCount++
-	p.IfAlias = r.IfAlias
+	if r.IfAlias != nil {
+		p.IfAlias = *r.IfAlias
+	}
+
 	if r.Time.Before(*p.FirstFlapTime) {
 		p.FirstFlapTime = &r.Time
 	} else if r.Time.After(*p.LastFlapTime) {
 		p.LastFlapTime = &r.Time
 	}
-	if r.IfOperStatus == ifStatusUP {
-		p.IfOperStatus = ifStatusUpCaption
-
-	} else if r.IfOperStatus == ifStatusDOWN {
-		p.IfOperStatus = ifStatusDownCaption
-
-	}
-
 }
 
 type Host struct {
@@ -381,25 +383,31 @@ func (f *Flapper) Review(startTime, endTime time.Time, filter Filter) (ReviewRes
 func (f *Flapper) FetchFromDB(query string) []PortRow {
 	var portRows []PortRow
 
-	rows, _ := f.db.Query(query)
-	for rows.Next() {
-		portRow := PortRow{}
-		err := rows.Scan(
-			&portRow.Id,
-			&portRow.Sid,
-			&portRow.Time,
-			&portRow.TimeTicks,
-			&portRow.Ipaddress,
-			&portRow.Hostname,
-			&portRow.IfIndex,
-			&portRow.IfName,
-			&portRow.IfAlias,
-			&portRow.IfOperStatus,
-		)
-		if err != nil {
-			log.Fatal(err)
+	rows, err := f.db.Query(query)
+	if err != nil {
+		log.Printf("Unable to connect DB: %s", err)
+
+	} else {
+		for rows.Next() {
+			portRow := PortRow{}
+			err := rows.Scan(
+				&portRow.Id,
+				&portRow.Sid,
+				&portRow.Time,
+				&portRow.TimeTicks,
+				&portRow.Ipaddress,
+				&portRow.Hostname,
+				&portRow.IfIndex,
+				&portRow.IfName,
+				&portRow.IfAlias,
+				&portRow.IfOperStatus,
+			)
+			if err != nil {
+				log.Fatal(err)
+			}
+			portRows = append(portRows, portRow)
+
 		}
-		portRows = append(portRows, portRow)
 	}
 	return portRows
 }
@@ -466,7 +474,7 @@ func (f *Flapper) FlapChart(q QueryParams) *FlapsDiagram {
 	for _, flap := range flaps {
 
 		if status == EnumUnknown {
-			if flap.IfOperStatus == ifStatusUP {
+			if flap.IfOperStatus == ifStatusUpCaption {
 				status = EnumDown
 			} else {
 				status = EnumUp
@@ -479,13 +487,13 @@ func (f *Flapper) FlapChart(q QueryParams) *FlapsDiagram {
 
 		val := timeLine[x]
 		if val == EnumUnknown {
-			if flap.IfOperStatus == ifStatusUP {
+			if flap.IfOperStatus == ifStatusUpCaption {
 				timeLine[x] = EnumUp
 			} else {
 				timeLine[x] = EnumDown
 			}
 		} else {
-			if flap.IfOperStatus == ifStatusUP {
+			if flap.IfOperStatus == ifStatusUpCaption {
 				timeLine[x] = EnumFlappingUp
 			} else {
 				timeLine[x] = EnumFlappingDown
@@ -561,18 +569,23 @@ func (s *Server) HandleReview(response http.ResponseWriter, request *http.Reques
 
 	jsonResults, err := json.Marshal(results)
 	if err != nil {
+		log.Printf("%s error: %s", request.URL, err)
 		response.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	response.Header().Add("Content-Type", "application/json")
 	response.Write(jsonResults)
 
 }
 
-func (s *Server) HandleCheck(response http.ResponseWriter) {
+func (s *Server) HandleCheck(response http.ResponseWriter, request *http.Request) {
+	logVerbose(fmt.Sprintln("?check requested"))
+
 	result := CheckResult{CheckResult: "flapmyport"}
 
 	jsonResult, err := json.Marshal(result)
 	if err != nil {
+		log.Printf("%s error: %s", request.URL, err)
 		response.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -583,15 +596,20 @@ func (s *Server) HandleFlapChart(response http.ResponseWriter, request *http.Req
 
 	queryParams, err := s.ParseQueryParams(request)
 	if err != nil {
+		log.Printf("%s error: %s", request.URL, err)
 		return
 	}
 
 	if queryParams.Host == "" {
-		s.http400(response, "Host not given")
+		msg := "Host not given"
+		log.Printf("%s error: %s", request.URL, msg)
+		s.http400(response, msg)
 		return
 	}
 	if queryParams.IfIndex == 0 {
-		s.http400(response, "Host not given")
+		msg := "Host not given"
+		log.Printf("%s error: %s", request.URL, msg)
+		s.http400(response, msg)
 		return
 	}
 
@@ -639,6 +657,7 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 	if startStr, ok := query[getParamStartTime]; ok {
 		if startStr[0] != "" {
 			if start, err := time.Parse(timeFormat, startStr[0]); err != nil {
+				log.Printf("%s invalid start time: %s", request.URL, err)
 				return queryParams, err
 			} else {
 				queryParams.Start = start
@@ -649,6 +668,7 @@ func (s *Server) ParseQueryParams(request *http.Request) (QueryParams, error) {
 	if endStr, ok := query[getParamEndTime]; ok {
 		if endStr[0] != "" {
 			if end, err := time.Parse(timeFormat, endStr[0]); err != nil {
+				log.Printf("%s invalid end time: %s", request.URL, err)
 				return queryParams, err
 			} else {
 				queryParams.End = end
@@ -675,9 +695,12 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 
 	queryParams, err := s.ParseQueryParams(request)
 	if err != nil {
+		log.Printf("%s ParseQueryParams error: %s", request.URL, err)
 		s.http400(response, err.Error())
 		return
 	}
+
+	logVerbose(fmt.Sprintf("/%s requested", queryParams.action))
 
 	switch queryParams.action {
 
@@ -688,7 +711,7 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 		s.HandleFlapChart(response, request, queryParams)
 
 	case actionCheck:
-		s.HandleCheck(response)
+		s.HandleCheck(response, request)
 
 	default:
 		s.Index(response)
@@ -696,11 +719,9 @@ func (s *Server) route(response http.ResponseWriter, request *http.Request) {
 
 }
 
-func readConfigFile() {
-
-	_, err := toml.DecodeFile(defaultConfigFilename, &config)
-	if err != nil {
-		msg := fmt.Sprintf("%s not found. Suppose we're using environment variables", defaultConfigFilename)
+func readConfigFile(file *string) {
+	if _, err := toml.DecodeFile(*file, &config); err != nil {
+		msg := fmt.Sprintf("%s not found. Suppose we're using environment variables", *file)
 		fmt.Println(msg)
 		log.Println(msg)
 	}
@@ -745,32 +766,51 @@ func readConfigEnv() {
 	}
 }
 
+func logVerbose(s string) {
+	if flagVerbose {
+		log.Print(s)
+	}
+}
+
 // MAIN
 
 func init() {
 
-	readConfigFile()
+	// Reading flags
+	flag.StringVar(&flagConfigFilename, "f", defaultConfigFilename, "Location of config file")
+	flag.BoolVar(&flagVerbose, "v", false, "Enable verbose logging")
+	flag.BoolVar(&flagVersion, "V", false, "Print version information and quit")
+	flag.Parse()
+
+	// Reading config
+	readConfigFile(&flagConfigFilename)
 	readConfigEnv()
+
+	logVerbose(fmt.Sprintf("DBHost: %s", config.DBHost))
+	logVerbose(fmt.Sprintf("DBName: %s", config.DBName))
+	logVerbose(fmt.Sprintf("DBUser: %s", config.DBUser))
+	logVerbose(fmt.Sprintf("DBPassword: %s", "***"))
 
 }
 
-func createServer(c Config) (*Server, error) {
+func createServer(c Config) *Server {
 	flapper, err := createFlapper(c.SqlDSN())
 	if err != nil {
-		return nil, err
+		log.Fatalf("Unable to create server: %s", err)
 	}
 	s := Server{flapper: flapper}
-	return &s, nil
+	return &s
 }
 
 func main() {
 
-	// TODO: enable logging
-
-	s, err := createServer(config)
-	if err != nil {
-		log.Fatal(err)
+	if flagVersion {
+		build := fmt.Sprintf("FlapMyPort snmpflapd version %s, build %s", version, build)
+		fmt.Println(build)
+		os.Exit(0)
 	}
+
+	s := createServer(config)
 
 	msg := fmt.Sprintf("Listening on %s:%d", config.ListenAddress, config.ListenPort)
 	fmt.Println(msg)
@@ -778,7 +818,7 @@ func main() {
 	http.HandleFunc("/", s.route)
 
 	listenSocket := fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort)
-	err = http.ListenAndServe(listenSocket, nil)
+	err := http.ListenAndServe(listenSocket, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
