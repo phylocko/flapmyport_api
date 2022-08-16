@@ -1,0 +1,17 @@
+[Unit]
+Description=FlapMyPort API
+Requires=mysql.service
+
+[Service]
+Type=simple
+User=root
+Group=wheel
+
+ExecStart=/usr/local/bin/flapmyport_api -f /etc/flapmyport_api/settings.conf
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill $MAINPID
+
+PIDFile=/var/run/flapmyport_api.pid
+
+[Install]
+WantedBy=multi-user.target
