@@ -119,7 +119,7 @@ type PortRow struct {
 	Time         time.Time
 	TimeTicks    int64
 	Ipaddress    string
-	Hostname     string
+	Hostname     *string
 	IfIndex      int
 	IfName       *string
 	IfAlias      *string
@@ -211,7 +211,11 @@ type Host struct {
 
 func (h *Host) FromDB(r PortRow) {
 	h.Ipaddress = r.Ipaddress
-	h.Name = r.Hostname
+	h.Name = ""
+	if r.Hostname != nil {
+		h.Name = *r.Hostname
+	}
+
 	port := PortView{}
 	port.FromDB(r)
 	h.Ports = append(h.Ports, port)
@@ -221,7 +225,10 @@ func (h *Host) UpdateFromDB(r PortRow) {
 	if h.Ipaddress != r.Ipaddress {
 		panic("Wrong usage of Host.UpdateFromDB")
 	}
-	h.Name = r.Hostname
+	h.Name = ""
+	if r.Hostname != nil {
+		h.Name = *r.Hostname
+	}
 
 	// Decide if we need to update existing port of create new one
 	for i, port := range h.Ports {
@@ -777,10 +784,17 @@ func logVerbose(s string) {
 func init() {
 
 	// Reading flags
+	flag.BoolVar(&flagVersion, "V", false, "Print version information and quit")
 	flag.StringVar(&flagConfigFilename, "f", defaultConfigFilename, "Location of config file")
 	flag.BoolVar(&flagVerbose, "v", false, "Enable verbose logging")
-	flag.BoolVar(&flagVersion, "V", false, "Print version information and quit")
+
 	flag.Parse()
+
+	if flagVersion {
+		build := fmt.Sprintf("FlapMyPort snmpflapd version %s, build %s", version, build)
+		fmt.Println(build)
+		os.Exit(0)
+	}
 
 	// Reading config
 	readConfigFile(&flagConfigFilename)
@@ -789,7 +803,6 @@ func init() {
 	logVerbose(fmt.Sprintf("DBHost: %s", config.DBHost))
 	logVerbose(fmt.Sprintf("DBName: %s", config.DBName))
 	logVerbose(fmt.Sprintf("DBUser: %s", config.DBUser))
-	logVerbose(fmt.Sprintf("DBPassword: %s", "***"))
 
 }
 
@@ -804,14 +817,8 @@ func createServer(c Config) *Server {
 
 func main() {
 
-	if flagVersion {
-		build := fmt.Sprintf("FlapMyPort snmpflapd version %s, build %s", version, build)
-		fmt.Println(build)
-		os.Exit(0)
-	}
-
 	s := createServer(config)
-
+	fmt.Println("flapmyport_api version:", version, "build:", build)
 	msg := fmt.Sprintf("Listening on %s:%d", config.ListenAddress, config.ListenPort)
 	fmt.Println(msg)
 
