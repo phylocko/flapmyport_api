@@ -326,7 +326,7 @@ func (f *Flapper) Review(startTime, endTime time.Time, filter Filter) (ReviewRes
 
 	SQLQuery := fmt.Sprintf(`SELECT id,
  		sid, 
-		time,
+		CONVERT_TZ(time, @@session.time_zone, 'UTC'),
 		timeticks,
 		ipaddress, 
 		hostname, 
@@ -335,7 +335,8 @@ func (f *Flapper) Review(startTime, endTime time.Time, filter Filter) (ReviewRes
 		ifAlias, 
 		ifOperStatus
 		FROM ports 
-		WHERE time >= '%s' AND time <= '%s'
+		WHERE CONVERT_TZ(time, @@session.time_zone, 'UTC') >= '%s' 
+		AND CONVERT_TZ(time, @@session.time_zone, 'UTC') <= '%s'
 		%s
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT %d;`,
 		startTime.Format(timeFormat),
@@ -423,7 +424,7 @@ func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIn
 
 	SQLQuery := fmt.Sprintf(`SELECT id,
  		sid, 
-		time,
+		CONVERT_TZ(time, @@session.time_zone, 'UTC'),
 		timeticks,
 		ipaddress, 
 		hostname, 
@@ -432,7 +433,9 @@ func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIn
 		ifAlias, 
 		ifOperStatus
 		FROM ports 
-		WHERE time >= '%s' AND time <= '%s' AND ipaddress = '%s' AND ifIndex = %d
+		WHERE CONVERT_TZ(time, @@session.time_zone, 'UTC') >= '%s' 
+		AND CONVERT_TZ(time, @@session.time_zone, 'UTC') <= '%s' 
+		AND ipaddress = '%s' AND ifIndex = %d
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT 100;`,
 		startTime.Format(timeFormat),
 		endTime.Format(timeFormat),
@@ -818,6 +821,7 @@ func createServer(c Config) *Server {
 func main() {
 
 	s := createServer(config)
+
 	fmt.Println("flapmyport_api version:", version, "build:", build)
 	msg := fmt.Sprintf("Listening on %s:%d", config.ListenAddress, config.ListenPort)
 	fmt.Println(msg)
