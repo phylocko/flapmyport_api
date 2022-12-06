@@ -337,6 +337,7 @@ func (f *Flapper) Review(startTime, endTime time.Time, filter Filter) (ReviewRes
 		FROM ports 
 		WHERE CONVERT_TZ(time, @@session.time_zone, 'UTC') >= '%s' 
 		AND CONVERT_TZ(time, @@session.time_zone, 'UTC') <= '%s'
+		AND ifName NOT LIKE '%%.%%'
 		%s
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT %d;`,
 		startTime.Format(timeFormat),
@@ -436,6 +437,7 @@ func (f *Flapper) PortFlaps(startTime, endTime time.Time, ipAddress string, ifIn
 		WHERE CONVERT_TZ(time, @@session.time_zone, 'UTC') >= '%s' 
 		AND CONVERT_TZ(time, @@session.time_zone, 'UTC') <= '%s' 
 		AND ipaddress = '%s' AND ifIndex = %d
+		AND ifName NOT LIKE '%%.%%'
 		ORDER BY ipaddress, ifIndex, time ASC, timeticks ASC LIMIT 100;`,
 		startTime.Format(timeFormat),
 		endTime.Format(timeFormat),
