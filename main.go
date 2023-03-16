@@ -201,6 +201,7 @@ func (p *PortView) updateFromDB(r PortRow) {
 	} else if r.Time.After(*p.LastFlapTime) {
 		p.LastFlapTime = &r.Time
 	}
+	p.IfOperStatus = r.IfOperStatus
 }
 
 type Host struct {
@@ -613,13 +614,13 @@ func (s *Server) HandleFlapChart(response http.ResponseWriter, request *http.Req
 	}
 
 	if queryParams.Host == "" {
-		msg := "Host not given"
+		msg := fmt.Sprintf("%s not given", getParamHost)
 		log.Printf("%s error: %s", request.URL, msg)
 		s.http400(response, msg)
 		return
 	}
 	if queryParams.IfIndex == 0 {
-		msg := "Host not given"
+		msg := fmt.Sprintf("%s not given", getParamIfIndex)
 		log.Printf("%s error: %s", request.URL, msg)
 		s.http400(response, msg)
 		return
